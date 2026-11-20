@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain.mcp import MCPAdapter
 from langchain.agents import create_agent
-from langchain.messages import HumanMessage, SystemMessage
+from langchain.messages import HumanMessage, SystemMessage, RemoveMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent.llm import model
@@ -56,32 +56,22 @@ async def list_threads(memory: AsyncSqliteSaver) -> list[str]:
     return sorted(threads)
 
 
+
 async def main():
+    db_path = Path(__file__).resolve().parent / "memory.db"
 
-    async with MCPAdapter(MCP_URL) as adapter:
-        tools = await adapter.list_tools()
-
-        print(f"Connected! Loaded {len(tools)} MCP tools.")
-
-        # DATABASE PATH
-        db_path = Path(__file__).resolve().parent / "memory.db"
-
+    try:
+        # Initialize the AsyncSqliteSaver with the database path.
         async with AsyncSqliteSaver.from_conn_string(str(db_path)) as memory:
 
-            agent = create_agent(
-                model=model,
-                tools=tools,
-                system_prompt=SystemMessage(content=SYSTEM_PROMPT),
-                checkpointer=memory
-            )
-
-            # Each student's name identifies their conversation thread.
             user_name = console.input(
                 "\n[bold cyan]Enter your name:[/bold cyan] "
             ).strip().casefold()
 
             if not user_name:
-                console.print("[red]Error: Name cannot be empty. Exiting.[/red]")
+                console.print(
+                    "[red]Error: Name cannot be empty. Exiting.[/red]"
+                )
                 return
 
             config = {
@@ -107,7 +97,7 @@ async def main():
                     console.print("[yellow]Goodbye![/yellow]")
                     break
 
-                # Switch Conversation
+                # SWITCH CONVERSATION
                 elif user_input.lower() == "/switch":
                     new_name = console.input(
                         "[cyan]Enter student name to switch to:[/cyan] "
@@ -126,7 +116,7 @@ async def main():
                             f"[green]Switched to {user_name}'s conversation.[/green]"
                         )
 
-                # Show conversation history
+                # SHOW CONVERSATION HISTORY
                 elif user_input.lower() == "/history":
                     threads = await list_threads(memory)
 
@@ -135,9 +125,11 @@ async def main():
                         for name in threads:
                             console.print(f"- {name}")
                     else:
-                        console.print("[yellow]No saved conversations found.[/yellow]")
+                        console.print(
+                            "[yellow]No saved conversations found.[/yellow]"
+                        )
 
-                # Forget current conversation
+                # FORGET CURRENT CONVERSATION
                 elif user_input.lower() == "/forget":
                     confirmation = console.input(
                         "[red]Are you sure you want to forget this conversation? (yes/no):[/red] "
@@ -145,82 +137,218 @@ async def main():
 
                     if confirmation == "yes":
                         await memory.adelete_thread(user_name)
+
                         console.print(
                             f"[green]Conversation for {user_name} has been forgotten.[/green]"
                         )
                     else:
-                        console.print("[yellow]Forget operation cancelled.[/yellow]")
+                        console.print(
+                            "[yellow]Forget operation cancelled.[/yellow]"
+                        )
 
+                # NORMAL USER MESSAGE
                 else:
                     console.print("\n[bold green]Agent:[/bold green]")
 
-                    streaming_text = False  # True while the answer is mid-line
+                    agent = None
+                    streaming_text = False
+                    previous_message_ids = set()
 
-                    async for chunk in agent.astream(
-                        {
-                            "messages": [
-                                HumanMessage(content=user_input)
-                            ]
-                        },
-                        config=config,
-                        stream_mode=["updates", "messages"],
-                        version="v2"
-                    ):
+                    try:
+                        # Initialize the MCPAdapter with the MCP URL.
+                        async with MCPAdapter(MCP_URL) as adapter:
 
-                        # 1. WATCHING THE STEPS: UPDATES
-                        if chunk["type"] == "updates":
+                            tools = await adapter.list_tools()
 
-                            for node, update in chunk["data"].items():
+                            agent = create_agent(
+                                model=model,
+                                tools=tools,
+                                system_prompt=SystemMessage(
+                                    content=SYSTEM_PROMPT
+                                ),
+                                checkpointer=memory
+                            )
 
-                                messages = update.get("messages", [])
+                            # Record the conversation state before this request.
+                            previous_state = await agent.aget_state(config)
 
-                                if not messages:
-                                    continue
+                            previous_messages = (
+                                previous_state.values.get("messages", [])
+                                if previous_state
+                                else []
+                            )
 
-                                msg = messages[-1]
+                            previous_message_ids = {
+                                msg.id
+                                for msg in previous_messages
+                                if getattr(msg, "id", None)
+                            }
 
-                                if node == "model" and msg.tool_calls:
-                                    if streaming_text:
-                                        print()
-                                        streaming_text = False
+                            # Stream the agent response.
+                            async for chunk in agent.astream(
+                                {
+                                    "messages": [
+                                        HumanMessage(content=user_input)
+                                    ]
+                                },
+                                config=config,
+                                stream_mode=["updates", "messages"],
+                                version="v2"
+                            ):
 
-                                    for call in msg.tool_calls:
-                                        console.print(
-                                            f"[yellow]  ⚙ {call['name']}[/yellow]"
-                                            f"[dim]({escape(str(call['args']))})[/dim]"
+                                # 1. WATCHING THE STEPS: UPDATES
+                                if chunk["type"] == "updates":
+
+                                    for node, update in chunk["data"].items():
+
+                                        messages = update.get("messages", [])
+
+                                        if not messages:
+                                            continue
+
+                                        msg = messages[-1]
+
+                                        if node == "model" and msg.tool_calls:
+
+                                            if streaming_text:
+                                                print()
+                                                streaming_text = False
+
+                                            for call in msg.tool_calls:
+                                                console.print(
+                                                    f"[yellow]  ⚙ {call['name']}[/yellow]"
+                                                    f"[dim]({escape(str(call['args']))})[/dim]"
+                                                )
+
+                                        elif node == "tools":
+
+                                            if streaming_text:
+                                                print()
+                                                streaming_text = False
+
+                                            result = " ".join(
+                                                str(msg.content).split()
+                                            )
+
+                                            if len(result) > 300:
+                                                result = result[:300] + "..."
+
+                                            console.print(
+                                                f"[green]  ↳ {msg.name}:[/green] "
+                                                f"[dim]{escape(result)}[/dim]"
+                                            )
+
+                                # 2. TYPING IT OUT: MESSAGES
+                                elif chunk["type"] == "messages":
+
+                                    token, metadata = chunk["data"]
+
+                                    if (
+                                        metadata.get("langgraph_node") == "model"
+                                        and token.text
+                                    ):
+                                        if not streaming_text:
+                                            print()
+                                            streaming_text = True
+
+                                        print(
+                                            token.text,
+                                            end="",
+                                            flush=True
                                         )
 
-                                elif node == "tools":
-                                    if streaming_text:
-                                        print()
-                                        streaming_text = False
+                            # Newline once, after the whole response.
+                            print()
 
-                                    result = " ".join(str(msg.content).split())
-                                    if len(result) > 300:
-                                        result = result[:300] + "..."
+                    except Exception as e:
+                        if streaming_text:
+                            print()
 
+                        console.print(
+                            f"[red]Request failed: {escape(str(e))}[/red]"
+                        )
+
+                        # RECOVER AN INTERRUPTED CONVERSATION
+
+                        if agent is not None:
+                            try:
+                                current_state = await agent.aget_state(config)
+
+                                current_messages = (
+                                    current_state.values.get("messages", [])
+                                    if current_state
+                                    else []
+                                )
+
+                                new_messages = [
+                                    msg
+                                    for msg in current_messages
+                                    if (
+                                        getattr(msg, "id", None)
+                                        and msg.id not in previous_message_ids
+                                    )
+                                ]
+
+                                # Find tool calls made during this request.
+                                new_tool_call_ids = {
+                                    call["id"]
+                                    for msg in new_messages
+                                    for call in getattr(msg, "tool_calls", []) 
+                                }
+
+                                # Find tool calls that have no ToolMessage result.
+                                completed_tool_call_ids = {
+                                    getattr(msg, "tool_call_id", None)
+                                    for msg in current_messages
+                                    if getattr(msg, "tool_call_id", None)
+                                }
+
+                                unresolved_tool_calls = (
+                                    new_tool_call_ids - completed_tool_call_ids
+                                )
+
+                                if unresolved_tool_calls:
+
+                                    # Roll back only messages from this failed turn.
+                                    removals = [
+                                        RemoveMessage(id=msg.id)
+                                        for msg in new_messages
+                                    ]
+
+                                    if removals:
+                                        await agent.aupdate_state(
+                                            config,
+                                            {"messages": removals}
+                                        )
+
+                                        console.print(
+                                            "[yellow]Interrupted request rolled back. "
+                                            "Previous conversation history preserved.[/yellow]"
+                                        )
+
+                                else:
                                     console.print(
-                                        f"[green]  ↳ {msg.name}:[/green] "
-                                        f"[dim]{escape(result)}[/dim]"
+                                        "[yellow]No incomplete tool call was found "
+                                        "in the saved conversation.[/yellow]"
                                     )
 
-                        # 2. TYPING IT OUT: MESSAGES
-                        elif chunk["type"] == "messages":
+                            except Exception as recovery_error:
+                                console.print(
+                                    "[red]Conversation recovery failed: "
+                                    f"{escape(str(recovery_error))}[/red]"
+                                )
 
-                            token, metadata = chunk["data"]
+                        console.print(
+                            "[yellow]You can continue using the agent. "
+                            "The next request will try a fresh MCP connection.[/yellow]"
+                        )
 
-                            if (
-                                metadata.get("langgraph_node") == "model"
-                                and token.text
-                            ):
-                                if not streaming_text:
-                                    print()  # blank line before the answer starts
-                                    streaming_text = True
 
-                                print(token.text, end="", flush=True)
 
-                    # newline once, AFTER the whole response is done
-                    print()
+    except Exception as e:
+        console.print(
+            f"[red]Application error: {escape(str(e))}[/red]"
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Persistent conversation memory
+*.db
+*.db-journal
+
+# IDE files
+.vscode/
+.idea/
